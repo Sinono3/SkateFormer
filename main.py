@@ -30,6 +30,8 @@ from torchlight import DictAction
 # LR Scheduler
 from timm.scheduler.cosine_lr import CosineLRScheduler
 
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 def init_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.manual_seed(seed)
@@ -103,6 +105,8 @@ def get_parser():
     parser.add_argument('--model-args', action=DictAction, default=dict(), help='the arguments of model')
     parser.add_argument('--weights', default=None, help='the weights for network initialization')
     parser.add_argument('--ignore-weights', type=str, default=[], nargs='+', help='the name of weights which will be ignored in the initialization')
+    parser.add_argument('--freeze_all', type=str2bool, default=False, help='if the weights are going to be frozen for training')
+    parser.add_argument('--unfreeze', type=str, default=[], nargs='+', help='the name of weights which will be unfreezed for training')
 
     # optim
     parser.add_argument('--base-lr', type=float, default=0.01, help='initial learning rate')
@@ -128,6 +132,8 @@ def get_parser():
 
 
 class Processor():
+    model: nn.Module
+
     def __init__(self, arg):
         self.arg = arg
         self.save_arg()
@@ -178,7 +184,7 @@ class Processor():
                 batch_size=self.arg.batch_size,
                 shuffle=True,
                 num_workers=self.arg.num_worker,
-                drop_last=True,
+                drop_last=False,
                 worker_init_fn=init_seed)
         self.data_loader['test'] = torch.utils.data.DataLoader(
             dataset=Feeder(**self.arg.test_feeder_args),
@@ -229,6 +235,17 @@ class Processor():
                     print('  ' + d)
                 state.update(weights)
                 self.model.load_state_dict(state)
+
+            if self.arg.freeze_all:
+                self.print_log("Freezing all parameters")
+
+                for name, param in self.model.named_parameters():
+                    freeze = name not in self.arg.unfreeze
+                    param.requires_grad_(freeze)
+
+                    if not freeze:
+                        self.print_log(f"Unfreezing {name}")
+                        
 
     def load_optimizer(self):
         if self.arg.optimizer == 'SGD':
@@ -415,8 +432,8 @@ class Processor():
 
             print('Accuracy: ', accuracy, ' model: ', self.arg.model_saved_name)
             if self.arg.phase == 'train':
-                self.val_writer.add_scalar('loss', loss, self.global_step)
-                self.val_writer.add_scalar('acc', accuracy, self.global_step)
+                self.train_writer.add_scalar('val_loss', loss, self.global_step)
+                self.train_writer.add_scalar('val_acc', accuracy, self.global_step)
 
             score_dict = dict(
                 zip(self.data_loader[ln].dataset.sample_name, score))
@@ -453,11 +470,8 @@ class Processor():
 
             self.print_log(f'# Parameters: {count_parameters(self.model)}')
             for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
-                if epoch + 1 < self.arg.num_epoch * 0.9:
-                    self.train(epoch, save_model=False)
-                else:
-                    self.train(epoch, save_model=True)
-                    self.eval(epoch, save_score=True, loader_name=['test'])
+                self.train(epoch, save_model=False)
+                self.eval(epoch, save_score=True, loader_name=['test'])
 
             # test the best model
             weights_path = glob.glob(os.path.join(self.arg.work_dir, 'runs-' + str(self.best_acc_epoch) + '*'))[0]
